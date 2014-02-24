@@ -296,6 +296,7 @@ seccomp=""
 glusterfs=""
 glusterfs_discard="no"
 glusterfs_zerofill="no"
+archipelago=""
 virtio_blk_data_plane=""
 gtk=""
 gtkabi="2.0"
@@ -1023,6 +1024,10 @@ for opt do
   ;;
   --enable-glusterfs) glusterfs="yes"
   ;;
+  --disable-archipelago) archipelago="no"
+  ;;
+  --enable-archipelago) archipelago="yes"
+  ;;
   --disable-virtio-blk-data-plane) virtio_blk_data_plane="no"
   ;;
   --enable-virtio-blk-data-plane) virtio_blk_data_plane="yes"
@@ -1301,6 +1306,8 @@ Advanced options (experts only):
   --enable-coroutine-pool  enable coroutine freelist (better performance)
   --enable-glusterfs       enable GlusterFS backend
   --disable-glusterfs      disable GlusterFS backend
+  --enable-archipelago     enable Archipelago backend
+  --disable-archipelago    disable Archipelago backend
   --enable-gcov            enable test coverage analysis with gcov
   --gcov=GCOV              use specified gcov [$gcov_tool]
   --enable-tpm             enable TPM support
@@ -2841,6 +2848,17 @@ EOF
   fi
 fi
 
+
+##########################################
+# archipelago probe
+if test "$archipelago" != "no" ; then
+    archipelago="yes"
+    archipelago_libs=-lxseg
+    libs_tools="$archipelago_libs $libs_tools"
+    libs_softmmu="$archipelago_libs $libs_softmmu"
+fi
+
+
 ##########################################
 # glusterfs probe
 if test "$glusterfs" != "no" ; then
@@ -4021,6 +4039,7 @@ echo "seccomp support   $seccomp"
 echo "coroutine backend $coroutine"
 echo "coroutine pool    $coroutine_pool"
 echo "GlusterFS support $glusterfs"
+echo "Archipelago support $archipelago"
 echo "virtio-blk-data-plane $virtio_blk_data_plane"
 echo "gcov              $gcov_tool"
 echo "gcov enabled      $gcov"
@@ -4440,6 +4459,10 @@ fi
 
 if test "$glusterfs_zerofill" = "yes" ; then
   echo "CONFIG_GLUSTERFS_ZEROFILL=y" >> $config_host_mak
+fi
+
+if test "$archipelago" = "yes" ; then
+  echo "CONFIG_ARCHIPELAGO=y" >> $config_host_mak
 fi
 
 if test "$libssh2" = "yes" ; then
