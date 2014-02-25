@@ -45,6 +45,7 @@
 
 #include <xseg/xseg.h>
 #include <xseg/protocol.h>
+#include <xseg/xjobhandler.h>
 
 #define ARCHIP_FD_READ      0
 #define ARCHIP_FD_WRITE     1
@@ -58,12 +59,6 @@ xport sport = NoPort;
 struct xseg_port *port;
 xport mportno = NoPort;
 xport vportno = NoPort;
-
-struct posixfd_signal_desc {
-    char signal_file[sizeof(void *)];
-    int fd;
-    int flag;
-};
 
 #define archipelagolog(fmt, ...) \
     fprintf(stderr, "archipelago\t%-24s" fmt, __func__, ##__VA_ARGS__)
@@ -102,6 +97,7 @@ typedef struct ArchipelagoCB {
     int64_t size;
     char *buf;
     int64_t ret;
+    struct xjobhandler *jobh;
 } ArchipelagoCB;
 
 typedef struct BDRVArchipelagoState {
@@ -121,6 +117,7 @@ typedef struct AIORequestData {
     ArchipelagoCB *aio_cb;
     int ret;
     int write;
+    struct xjobhandler *jobh;
 } AIORequestData;
 
 typedef struct ArchipelagoThread {
@@ -157,17 +154,17 @@ static void archipelago_finish_aiocb(ArchipelagoCB *aio_cb, ssize_t c,
 	if(ret < 0) {
 		error_report("archipelago_finish_aiocb(): failed writing to acb->s->fds");
 		g_free(aio_cb);
-        g_free(reqdata);
-        /* Lock disk and exit ??*/
+		g_free(reqdata);
+		/* Lock disk and exit ??*/
 	}
-    g_free(reqdata);
+	g_free(reqdata);
 }
 
 static int wait_reply(struct xseg_request *expected_req)
 {
     struct xseg_request *rec;
     xseg_prepare_wait(xseg, srcport);
-    struct posixfd_signal_desc *psd = xseg_get_signal_desc(xseg, port);
+    struct void *sd = xseg_get_signal_desc(xseg, port);
     while(1) {
         rec = xseg_receive(xseg, srcport, 0);
         if(rec) {
@@ -181,10 +178,18 @@ static int wait_reply(struct xseg_request *expected_req)
                 break;
             }
         }
-        xseg_wait_signal(xseg, psd, 10000000UL);
+        xseg_wait_signal(xseg, sd, 10000000UL);
     }
     xseg_cancel_wait(xseg, srcport);
     return 0;
+}
+
+void on_job_complete(int failed, void *arg)
+{
+	ArchipelagoCB *aio_cb = arg;
+	struct xjobhandler *jobh = aio_cb->jobh;
+	archipelago_finish_aiocb(aio_cb);
+	free(jobh);
 }
 
 static void xseg_request_handler(void *arthd)
@@ -198,6 +203,7 @@ static void xseg_request_handler(void *arthd)
         req = xseg_receive(xseg, srcport, 0);
         if(req){
             AIORequestData *reqdata;
+	    struct xjobhandler *jobh = reqdata->jobh;
             xseg_get_req_data(xseg, req, (void **)&reqdata);
             if(reqdata->write == ARCHIP_AIO_READ){
                 char *data = xseg_get_data(xseg, req);
@@ -206,9 +212,11 @@ static void xseg_request_handler(void *arthd)
                 xseg_put_request(xseg, req, srcport);
                 archipelago_finish_aiocb(reqdata->aio_cb, reqdata->ret, reqdata);
             } else if(reqdata->write == ARCHIP_AIO_WRITE) {
-                reqdata->ret = req->serviced;
+		aio_cb = reqdata->aio_cb;
+		aio_cb->ret += req->serviced //atomic;
                 xseg_put_request(xseg, req, srcport);
-                archipelago_finish_aiocb(reqdata->aio_cb, reqdata->ret, reqdata);
+		g_free(reqdata);
+		xjobhandler_jobcompleted(jobh);
             } else if (reqdata->write == ARCHIP_AIO_VOLINFO) {
                 is_signaled = 1;
                 qemu_cond_signal(&archip_cond);
@@ -672,12 +680,13 @@ err_exit2:
     return -1;
 }
 
-static int archipelago_aio_write(char  *volname, char *buf, ssize_t count, off_t offset, ArchipelagoCB *aio_cb)
+static int __archipelago_aio_write(char  *volname, char *buf, ssize_t count, off_t offset, struct xjobhandler *jobh)
 {
     char *data = NULL;
     int ret;
     AIORequestData *reqdata = g_malloc(sizeof(AIORequestData));
     int targetlen = strlen(volname);
+
     struct xseg_request *req = xseg_get_request(xseg, srcport, vportno, X_ALLOC);
     if(!req) {
         archipelagolog("Cannot get xseg request.\n");
@@ -704,6 +713,7 @@ static int archipelago_aio_write(char  *volname, char *buf, ssize_t count, off_t
     reqdata->size = count;
     reqdata->buf = buf;
     reqdata->aio_cb = aio_cb;
+    reqdata->jobh = jobh;
     reqdata->write = ARCHIP_AIO_WRITE;
 
     xseg_set_req_data(xseg, req, reqdata);
@@ -727,6 +737,35 @@ err_exit:
     return -1;
 err_exit2:
     return -1;
+}
+
+static int archipelago_aio_write(char  *volname, char *buf, ssize_t count, off_t offset, ArchipelagoCB *aio_cb)
+{
+    char *data = NULL;
+    int ret;
+
+    struct xjobhandler *jobh = g_malloc(sizeof(struct xjobhandler));
+
+    xjobhandler_init(jobh, 0, aio_cb, on_job_complete);
+    aio_cb->jobh = jobh;
+
+    ssize_t c = 0;
+    ssize_t req_count;
+    off_t req_offset;
+    while (c < count) {
+	    req_offset = offset + c;
+	    req_count = (count - c > MAX_REQ_SIZE) ? MAX_REQ_SIZE : count - c;
+	    xjobhandler_jobcreated(jobh);
+	    r = __archipelago_aio_write(volname, buf + c, req_count, req_offset, jobh);
+	    if (r < 0) {
+		    xjobhandler_jobfailed(jobh);
+		    break;
+	    }
+	    c += MAX_REQ_SIZE;
+    }
+
+    xjobhandler_jobsended(jobh);
+    return 0;
 }
 
 static BlockDriverAIOCB *qemu_archipelago_aio_rw(BlockDriverState *bs,
