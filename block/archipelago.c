@@ -782,6 +782,7 @@ static BlockDriverAIOCB *qemu_archipelago_aio_rw(BlockDriverState *bs,
 out:
     error_report("qemu_archipelago_aio_rw(): I/O Error. Aborting...\n");
     s->qemu_aio_count--;
+    g_free(aio_cb);
     qemu_aio_release(acb);
     return NULL;
 }
